@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/html/atom"
 )
 
 // https://github.com/golang/go/issues/58246
@@ -626,6 +628,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +945,136 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+// TestDuplicateAttributes checks that only the first of a set of duplicate
+// attributes is kept, which is what a browser does. Keeping the later
+// duplicates lets an attacker smuggle an attribute past a sanitizer that
+// inspects one occurrence but re-renders (or lets the browser see) another.
+func TestDuplicateAttributes(t *testing.T) {
+	testCases := []struct {
+		desc string
+		html string
+		want []Attribute
+	}{
+		{
+			"duplicate attribute",
+			`<img src="safe.png" src="javascript:alert(1)">`,
+			[]Attribute{{Key: "src", Val: "safe.png"}},
+		},
+		{
+			"duplicate attribute, ASCII case-insensitive",
+			`<img SRC="safe.png" src="javascript:alert(1)">`,
+			[]Attribute{{Key: "src", Val: "safe.png"}},
+		},
+		{
+			"duplicate event handler",
+			`<div onclick="safe()" onclick="alert(1)" ONCLICK="alert(2)">`,
+			[]Attribute{{Key: "onclick", Val: "safe()"}},
+		},
+		{
+			"duplicates interleaved with unique attributes",
+			`<a href="/safe" title="t" href="javascript:alert(1)" id="x" TITLE="u">`,
+			[]Attribute{
+				{Key: "href", Val: "/safe"},
+				{Key: "title", Val: "t"},
+				{Key: "id", Val: "x"},
+			},
+		},
+		{
+			"empty valued duplicate",
+			`<div hidden hidden="alert(1)">`,
+			[]Attribute{{Key: "hidden", Val: ""}},
+		},
+		{
+			"non-ASCII case is not folded",
+			`<div ä="1" Ä="2">`,
+			[]Attribute{
+				{Key: "ä", Val: "1"},
+				{Key: "Ä", Val: "2"},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			// High level: Token().Attr must be free of duplicates.
+			z := NewTokenizer(strings.NewReader(tc.html))
+			if tt := z.Next(); tt != StartTagToken {
+				t.Fatalf("expected StartTagToken, got %s", tt)
+			}
+			if got := z.Token().Attr; !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Token().Attr = %v, want %v", got, tc.want)
+			}
+
+			// Low level: TagAttr must yield the same attributes.
+			z = NewTokenizer(strings.NewReader(tc.html))
+			if tt := z.Next(); tt != StartTagToken {
+				t.Fatalf("expected StartTagToken, got %s", tt)
+			}
+			var got []Attribute
+			_, more := z.TagName()
+			for more {
+				var key, val []byte
+				key, val, more = z.TagAttr()
+				got = append(got, Attribute{Key: string(key), Val: string(val)})
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("TagAttr attributes = %v, want %v", got, tc.want)
+			}
+
+			// The parser builds on the tokenizer, so the parsed tree must be
+			// free of duplicates too.
+			ns, err := ParseFragment(strings.NewReader(tc.html), &Node{
+				Type:     ElementNode,
+				Data:     "body",
+				DataAtom: atom.Body,
+			})
+			if err != nil {
+				t.Fatalf("ParseFragment: %v", err)
+			}
+			if len(ns) != 1 {
+				t.Fatalf("expected 1 parsed node, got %d", len(ns))
+			}
+			if got := ns[0].Attr; !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("parsed node attributes = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDuplicateAttributesReuse checks that the set of seen attribute names is
+// reset between tags, so a name used in an earlier tag does not suppress the
+// same name in a later one.
+func TestDuplicateAttributesReuse(t *testing.T) {
+	const in = `<div id="a" id="b"><div id="c"></div></div>`
+	const want = `<div id="a">$<div id="c">$</div>$</div>`
+	z := NewTokenizer(strings.NewReader(in))
+	for i, s := range strings.Split(want, "$") {
+		if z.Next() == ErrorToken {
+			t.Fatalf("token %d: want %q got error %v", i, s, z.Err())
+		}
+		if got := z.Token().String(); got != s {
+			t.Errorf("token %d: want %q got %q", i, s, got)
+		}
+	}
+}
