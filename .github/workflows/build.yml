@@ -1,0 +1,111 @@
+name: build
+
+# golang.org/x/net is developed on Gerrit (go.googlesource.com/net) and tested by
+# the Go project's TryBots; the repository ships no GitHub Actions CI. This
+# workflow reproduces what those TryBots do for an x/ repo: build every package
+# and run the whole test suite with the toolchain the module's go directive
+# declares, then pack the module source zip the Go proxy serves.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated top-level test names to run; empty runs the full suite.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# No GOPROXY override: the seal time machine is not resolvable from
+# GitHub-hosted runners, and go.sum already pins every dependency of this
+# release to an exact version and hash, so the default proxy resolves the same
+# set. GOFLAGS is left at its default -mod=readonly so the build cannot mutate
+# go.mod or go.sum.
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # The go directive in go.mod is the toolchain this release targets.
+          go-version-file: go.mod
+
+      - name: Report toolchain
+        run: go version
+
+      # The module zip is packed from the source tree, so it is produced before
+      # anything is built and from a staged copy that omits .github: the public
+      # v0.45.0.zip carries no .github member and this workflow must not become
+      # one.
+      - name: Stage module tree
+        run: |
+          mkdir -p "$RUNNER_TEMP/modsrc" "$GITHUB_WORKSPACE/build_output"
+          tar -c --exclude=./.git --exclude=./.github -C "$GITHUB_WORKSPACE" . \
+            | tar -x -C "$RUNNER_TEMP/modsrc"
+          test ! -e "$RUNNER_TEMP/modsrc/.github"
+
+      - name: Pack module zip
+        run: |
+          mkdir -p "$RUNNER_TEMP/zipper"
+          cd "$RUNNER_TEMP/zipper"
+          # The Go helper below is indented with spaces only: a tab anywhere in
+          # this block scalar does not survive the fork sync's YAML round-trip.
+          cat > create_mod.go <<'EOF'
+          package main
+          import (
+              "log"
+              "os"
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: create_mod <module-path> <version> <src-dir> <out-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          # The helper lives in its own module so golang.org/x/mod never enters
+          # the packaged go.mod.
+          go mod init example.com/zipper
+          go get golang.org/x/mod
+          go run ./create_mod.go golang.org/x/net v0.45.0 \
+            "$RUNNER_TEMP/modsrc" "$GITHUB_WORKSPACE/build_output/v0.45.0.zip"
+          unzip -l "$GITHUB_WORKSPACE/build_output/v0.45.0.zip" | tail -5
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: |
+          # Without pipefail the `| tee` below would swallow go test's exit
+          # status and a failing scoped run would report success.
+          set -o pipefail
+          filter='${{ inputs.test-filter }}'
+          if [ -n "$filter" ]; then
+            go test -v -run "^($(echo "$filter" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in $filter; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test ./...
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
