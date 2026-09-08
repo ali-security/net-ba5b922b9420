@@ -13,9 +13,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/html/atom"
 )
@@ -542,5 +544,167 @@ func TestDepthLimit(t *testing.T) {
 				t.Errorf("unexpected success")
 			}
 		})
+	}
+}
+
+// countElements returns the number of element nodes with the given atom in the
+// tree rooted at n.
+func countElements(n *Node, want atom.Atom) int {
+	count := 0
+	if n.Type == ElementNode && n.DataAtom == want {
+		count++
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		count += countElements(c, want)
+	}
+	return count
+}
+
+// TestFormattingElementAttributesAreSorted checks that the attributes of an
+// active formatting element are normalized into a canonical order, which is
+// what lets the Noah's Ark clause compare two elements with slices.Equal
+// instead of the quadratic cross product it used before CVE-2026-25680.
+func TestFormattingElementAttributesAreSorted(t *testing.T) {
+	doc, err := Parse(strings.NewReader(`<b zz=1 aa=3 mm=2 aa2=0>x`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var b *Node
+	var walk func(*Node)
+	walk = func(n *Node) {
+		if b == nil && n.Type == ElementNode && n.DataAtom == atom.B {
+			b = n
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	if b == nil {
+		t.Fatal("no <b> element in parse tree")
+	}
+	sorted := slices.IsSortedFunc(b.Attr, func(x, y Attribute) int {
+		if c := strings.Compare(x.Namespace, y.Namespace); c != 0 {
+			return c
+		}
+		if c := strings.Compare(x.Key, y.Key); c != 0 {
+			return c
+		}
+		return strings.Compare(x.Val, y.Val)
+	})
+	if !sorted {
+		t.Errorf("attributes of <b> are not sorted: %v", b.Attr)
+	}
+	var got []string
+	for _, a := range b.Attr {
+		got = append(got, a.Key)
+	}
+	want := []string{"aa", "aa2", "mm", "zz"}
+	if !slices.Equal(got, want) {
+		t.Errorf("attribute keys = %v, want %v", got, want)
+	}
+}
+
+// TestNoahsArkClauseAttributeOrder checks that the Noah's Ark clause still
+// treats two formatting elements as identical when they carry the same
+// attributes in a different source order, which is the behaviour the sorting
+// introduced for CVE-2026-25680 has to preserve.
+func TestNoahsArkClauseAttributeOrder(t *testing.T) {
+	// The second <p> pops the <b> elements off the stack of open elements but
+	// leaves them on the list of active formatting elements, so the trailing
+	// text reconstructs one <b> per surviving entry. The Noah's Ark clause
+	// drops the oldest of four identical entries, so an input whose <b>
+	// elements are all identical reconstructs one fewer element than an input
+	// whose <b> elements genuinely differ.
+	const (
+		canonical = `<p><b id=x class=y><b id=x class=y><b id=x class=y><b id=x class=y>1<p>2`
+		permuted  = `<p><b class=y id=x><b id=x class=y><b class=y id=x><b id=x class=y>1<p>2`
+		distinct  = `<p><b id=x1 class=y><b id=x2 class=y><b id=x3 class=y><b id=x4 class=y>1<p>2`
+	)
+	render := func(src string) (string, int) {
+		t.Helper()
+		doc, err := Parse(strings.NewReader(src))
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", src, err)
+		}
+		var buf strings.Builder
+		if err := Render(&buf, doc); err != nil {
+			t.Fatalf("Render(%q): %v", src, err)
+		}
+		return buf.String(), countElements(doc, atom.B)
+	}
+
+	canonicalHTML, canonicalCount := render(canonical)
+	permutedHTML, permutedCount := render(permuted)
+	_, distinctCount := render(distinct)
+
+	if canonicalHTML != permutedHTML {
+		t.Errorf("permuting attribute order changed the parse tree:\n got %q\nwant %q", permutedHTML, canonicalHTML)
+	}
+	if canonicalCount != permutedCount {
+		t.Errorf("permuted input has %d <b> elements, canonical input has %d", permutedCount, canonicalCount)
+	}
+	if canonicalCount >= distinctCount {
+		t.Errorf("Noah's Ark clause did not fire: identical input has %d <b> elements, distinct input has %d", canonicalCount, distinctCount)
+	}
+}
+
+// noahsArkBlowupInput builds nested formatting elements that maximize the work
+// done by the Noah's Ark clause in addFormattingElement. Every element carries
+// the same number of attributes and the same tag, so none of the cheap
+// short-circuits apply; the shared attributes are rotated by a different amount
+// in every element, so a positional scan finds each match only after walking
+// half the list on average; and the single attribute that makes an element
+// unique is written last, so the comparison bails out only after examining
+// every other attribute.
+func noahsArkBlowupInput(elements, attrs int) string {
+	shared := make([]string, attrs)
+	for i := range shared {
+		shared[i] = fmt.Sprintf(" x%05d=1", i)
+	}
+	var b strings.Builder
+	b.Grow(elements * (attrs + 1) * len(shared[0]))
+	for i := 0; i < elements; i++ {
+		b.WriteString("<b")
+		for t := 0; t < attrs; t++ {
+			b.WriteString(shared[(i+t)%attrs])
+		}
+		// The distinguishing attribute sorts before every shared one, so the
+		// fixed comparison rejects the element on its first attribute.
+		fmt.Fprintf(&b, " a%05d=1>", i)
+	}
+	return b.String()
+}
+
+// TestNoahsArkClauseComplexity is a regression test for CVE-2026-25680: the
+// Noah's Ark clause used to compare every attribute of every active formatting
+// element against every attribute of the incoming one, making tree
+// construction cubic and letting a few megabytes of HTML burn minutes of CPU.
+func TestNoahsArkClauseComplexity(t *testing.T) {
+	const (
+		// 202 open elements stays under the parser's 512 element stack limit.
+		elements = 200
+		attrs    = 2000
+		// Parsing this input takes well under a second with the fix and
+		// minutes without it.
+		budget = 15 * time.Second
+	)
+	src := noahsArkBlowupInput(elements, attrs)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Parse(strings.NewReader(src))
+		done <- err
+	}()
+
+	start := time.Now()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		t.Logf("parsed %d bytes of nested formatting elements in %v", len(src), time.Since(start))
+	case <-time.After(budget):
+		t.Fatalf("parsing %d bytes of nested formatting elements did not complete within %v", len(src), budget)
 	}
 }
